@@ -5,6 +5,7 @@ import random
 import shutil
 import tempfile
 import threading
+import traceback
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor
 from selenium import webdriver
@@ -22,20 +23,17 @@ if sys.platform == "win32":
 # ---------------- CONFIGURATION (Railway Env Overrides) ----------------
 VIDEO_URL = os.getenv("VIDEO_URL", "https://www.youtube.com/shorts/eTSipzkBEpQ")
 TARGET_VIEWS = int(os.getenv("TARGET_VIEWS", "1000"))
-# In free/starter cloud containers (512MB RAM), 1 worker is required to avoid Out-Of-Memory (OOM) crashes
 CONCURRENT_WORKERS = int(os.getenv("CONCURRENT_WORKERS", "1"))
 WATCH_MIN_SEC = int(os.getenv("WATCH_MIN_SEC", "35"))
 WATCH_MAX_SEC = int(os.getenv("WATCH_MAX_SEC", "55"))
 HEADLESS = os.getenv("HEADLESS", "true").lower() in ("true", "1", "yes")
 
-# Proxies can be comma-separated in Railway ENV, e.g. "ip:port,user:pass@ip:port"
 raw_proxies = os.getenv("PROXIES", "")
 PROXIES = [p.strip() for p in raw_proxies.split(",") if p.strip()]
 
 PORT = int(os.getenv("PORT", "8080"))
 # ----------------------------------------------------------------------
 
-# Global stats for Railway healthcheck / status web page
 stats = {
     "completed_views": 0,
     "active_workers": 0,
@@ -48,6 +46,14 @@ stats_lock = threading.Lock()
 
 class SimpleHealthHandler(BaseHTTPRequestHandler):
     """Responds to Railway HTTP healthchecks so the service stays active and healthy."""
+    def do_HEAD(self):
+        try:
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+        except Exception:
+            pass
+
     def do_GET(self):
         try:
             self.send_response(200)
@@ -67,13 +73,13 @@ class SimpleHealthHandler(BaseHTTPRequestHandler):
 def start_health_server():
     try:
         server = HTTPServer(("0.0.0.0", PORT), SimpleHealthHandler)
-        print(f"[Railway] Healthcheck server listening on port {PORT}...", flush=True)
+        print(f"[Railway] Healthcheck server listening on 0.0.0.0:{PORT}...", flush=True)
         server.serve_forever()
     except Exception as e:
         print(f"[Railway] Health server warning: {e}", flush=True)
 
 
-def get_chrome_options(temp_dir: str):
+def get_chrome_driver(temp_dir: str):
     options = Options()
     options.add_argument(f"--user-data-dir={temp_dir}")
     options.add_argument("--mute-audio")
@@ -83,8 +89,9 @@ def get_chrome_options(temp_dir: str):
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
 
-    # Low-RAM & Cloud Container Stability (prevents OOM / dev-shm crash)
+    # Low-RAM & Cloud Container Stability (Prevents DevToolsActivePort & OOM crashes)
     options.add_argument("--no-sandbox")
+    options.add_argument("--disable-setuid-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-software-rasterizer")
@@ -92,11 +99,15 @@ def get_chrome_options(temp_dir: str):
     options.add_argument("--media-cache-size=1")
     options.add_argument("--blink-settings=imagesEnabled=false")
 
-    # Locate Chrome binary on Linux containers
-    for bin_path in ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium"]:
-        if os.path.exists(bin_path):
-            options.binary_location = bin_path
-            break
+    # Locate Chrome / Chromium binary on Linux
+    chrome_binary = os.getenv("CHROME_BIN", "")
+    if not chrome_binary:
+        for p in ["/usr/bin/chromium", "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"]:
+            if os.path.exists(p):
+                chrome_binary = p
+                break
+    if chrome_binary and os.path.exists(chrome_binary):
+        options.binary_location = chrome_binary
 
     if HEADLESS:
         options.add_argument("--headless=new")
@@ -115,7 +126,16 @@ def get_chrome_options(temp_dir: str):
         proxy = random.choice(PROXIES)
         options.add_argument(f"--proxy-server={proxy}")
 
-    return options
+    # Check for local Linux chromedriver
+    chromedriver_path = os.getenv("CHROMEDRIVER_PATH", "")
+    if not chromedriver_path and os.path.exists("/usr/bin/chromedriver"):
+        chromedriver_path = "/usr/bin/chromedriver"
+
+    if chromedriver_path and os.path.exists(chromedriver_path):
+        service = Service(executable_path=chromedriver_path)
+        return webdriver.Chrome(service=service, options=options)
+    else:
+        return webdriver.Chrome(options=options)
 
 
 def view_task(view_number: int):
@@ -126,13 +146,10 @@ def view_task(view_number: int):
         stats["active_workers"] += 1
 
     try:
-        # Stagger slightly to avoid CPU load
         time.sleep(random.uniform(1.0, 3.0))
 
-        options = get_chrome_options(temp_dir)
-        driver = webdriver.Chrome(options=options)
+        driver = get_chrome_driver(temp_dir)
 
-        # Remove navigator.webdriver detection flag via CDP
         try:
             driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
                 "source": """
@@ -148,7 +165,6 @@ def view_task(view_number: int):
         driver.get(VIDEO_URL)
         time.sleep(4)
 
-        # 1. Dismiss YouTube cookie / consent prompt if present
         try:
             consent_btn = driver.find_element(
                 By.XPATH, 
@@ -159,7 +175,6 @@ def view_task(view_number: int):
         except Exception:
             pass
 
-        # 2. Check and start playback for standard videos or Shorts
         try:
             play_btn = driver.find_element(By.CSS_SELECTOR, "button.ytp-play-button")
             btn_state = play_btn.get_attribute("title") or play_btn.get_attribute("aria-label") or ""
@@ -176,7 +191,6 @@ def view_task(view_number: int):
         except Exception:
             pass
 
-        # 3. Watch duration
         watch_duration = random.randint(WATCH_MIN_SEC, WATCH_MAX_SEC)
         print(f"[View #{view_number}] Watching for {watch_duration}s...", flush=True)
         time.sleep(watch_duration)
@@ -187,6 +201,7 @@ def view_task(view_number: int):
 
     except Exception as e:
         print(f"[View #{view_number}] Error: {e}", flush=True)
+        traceback.print_exc()
     finally:
         with stats_lock:
             stats["active_workers"] = max(0, stats["active_workers"] - 1)
@@ -209,7 +224,6 @@ def main():
     print(f"Proxies configured: {len(PROXIES)}", flush=True)
     print(f"==========================================\n", flush=True)
 
-    # Start healthcheck HTTP server in background thread for Railway
     health_thread = threading.Thread(target=start_health_server, daemon=True)
     health_thread.start()
 
